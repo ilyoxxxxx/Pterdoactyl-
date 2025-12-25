@@ -1,0 +1,13 @@
+name = "panel-api"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+kv_namespaces = [
+  { binding = "ROLES", id = "53312659ade44015b4d25ff435a18467" },
+  { binding = "LOGS", id = "b4d68796aae4488e8538f1cb15857bc0" }
+]
+
+[vars]
+JWT_SECRET = "Bumpx@@@"
+PTERO_URL = "https://host.bumpx.fr"
+PTERO_KEY = "ptla_OqIzk07tqu35RifvrNfetwHn8gRPZ4Rl6WveCtDMYNq"
