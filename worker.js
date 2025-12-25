@@ -1,5 +1,3 @@
-import jwt from "@tsndr/cloudflare-worker-jwt";
-
 /* =====================
    ROLES & PERMISSIONS
 ===================== */
@@ -33,11 +31,9 @@ export default {
       if (!auth) return res("Unauthorized", 401);
 
       const token = auth.replace("Bearer ", "");
-      if (!(await jwt.verify(token, env.JWT_SECRET))) {
-        return res("Invalid token", 401);
-      }
+      const payload = await verifyJWT(token, env.JWT_SECRET);
+      if (!payload) return res("Invalid token", 401);
 
-      const payload = jwt.decode(token);
       const userId = payload.id;
 
       const userData = await env.ROLES.get(`user:${userId}`, "json");
@@ -58,7 +54,6 @@ export default {
         requirePerm(role, "SUSPEND_SERVER");
 
         const { serverId } = await req.json();
-
         await addLog(env, userId, role, "SUSPEND_SERVER", `server:${serverId}`);
 
         return proxyPtero(
@@ -73,7 +68,6 @@ export default {
         requirePerm(role, "RENAME_SERVER");
 
         const { serverId, name } = await req.json();
-
         await addLog(env, userId, role, "RENAME_SERVER", `server:${serverId}`);
 
         return proxyPtero(
@@ -84,7 +78,7 @@ export default {
         );
       }
 
-      // ❌ Supprimer utilisateur (sauf chef)
+      // ❌ Supprimer utilisateur
       if (url.pathname === "/users/delete" && req.method === "DELETE") {
         requirePerm(role, "DELETE_USER");
 
@@ -95,14 +89,7 @@ export default {
         if (target.role === "chef") return res("Cannot delete chef", 403);
 
         await env.ROLES.delete(`user:${targetUserId}`);
-
-        await addLog(
-          env,
-          userId,
-          role,
-          "DELETE_USER",
-          `user:${targetUserId}`
-        );
+        await addLog(env, userId, role, "DELETE_USER", `user:${targetUserId}`);
 
         return proxyPtero(
           `/api/application/users/${targetUserId}`,
@@ -111,7 +98,7 @@ export default {
         );
       }
 
-      // 👑 Assigner rôle (CHEF)
+      // 👑 Gestion rôles (chef)
       if (url.pathname === "/roles/set" && req.method === "POST") {
         requirePerm(role, "MANAGE_ROLES");
 
@@ -119,7 +106,6 @@ export default {
         if (!ROLE_HIERARCHY[newRole]) return res("Invalid role", 400);
 
         const target = await env.ROLES.get(`user:${targetUserId}`, "json");
-
         if (target?.role === "chef" && newRole !== "chef") {
           return res("Chef immutable", 403);
         }
@@ -140,21 +126,50 @@ export default {
         return res("Role updated");
       }
 
-      // 📜 LOGS (CHEF ONLY)
+      // 📜 Logs (chef only)
       if (url.pathname === "/logs" && req.method === "GET") {
         requirePerm(role, "VIEW_LOGS");
-
-        const logs = await getLogs(env, 50);
+        const logs = await getLogs(env);
         return json(logs);
       }
 
       return res("Not found", 404);
-    } catch (err) {
-      if (err instanceof Response) return err;
+    } catch (e) {
+      if (e instanceof Response) return e;
       return res("Internal error", 500);
     }
   }
 };
+
+/* =====================
+   JWT NATIF
+===================== */
+
+async function verifyJWT(token, secret) {
+  const [headerB64, payloadB64, signatureB64] = token.split(".");
+  if (!signatureB64) return null;
+
+  const data = `${headerB64}.${payloadB64}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const signature = Uint8Array.from(atob(signatureB64.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    signature,
+    new TextEncoder().encode(data)
+  );
+
+  if (!valid) return null;
+
+  return JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/")));
+}
 
 /* =====================
    UTILS
@@ -185,22 +200,14 @@ async function proxyPtero(path, env, method = "GET", body) {
 
 async function addLog(env, actorId, actorRole, action, target) {
   const timestamp = Date.now();
-
   await env.LOGS.put(
     `log:${timestamp}`,
-    JSON.stringify({
-      actorId,
-      actorRole,
-      action,
-      target,
-      timestamp
-    })
+    JSON.stringify({ actorId, actorRole, action, target, timestamp })
   );
 }
 
 async function getLogs(env, limit = 50) {
   const list = await env.LOGS.list({ prefix: "log:" });
-
   return Promise.all(
     list.keys
       .sort((a, b) => b.name.localeCompare(a.name))
