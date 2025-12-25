@@ -1,32 +1,24 @@
-/* =====================
-   ROLES & PERMISSIONS
-===================== */
+/* =====================================================
+   CONFIG
+===================================================== */
 
-const ROLE_HIERARCHY = {
-  "modérateur": 1,
-  "sous-chef": 2,
-  "chef": 3
-};
+const BOOTSTRAP_ADMIN_EMAIL = "admin@bumpx.fr";
 
-const PERMISSIONS = {
-  VIEW_SERVERS: 1,
-  SUSPEND_SERVER: 2,
-  RENAME_SERVER: 2,
-  DELETE_USER: 2,
-  MANAGE_ROLES: 3,
-  VIEW_LOGS: 3
-};
-
-/* =====================
+/* =====================================================
    WORKER
-===================== */
+===================================================== */
 
 export default {
   async fetch(req, env) {
     try {
       const url = new URL(req.url);
 
-      /* ========= AUTH ========= */
+      /* ================= AUTH ================= */
+
+      if (url.pathname === "/auth/login" && req.method === "POST") {
+        return login(req, env);
+      }
+
       const auth = req.headers.get("Authorization");
       if (!auth) return res("Unauthorized", 401);
 
@@ -34,103 +26,47 @@ export default {
       const payload = await verifyJWT(token, env.JWT_SECRET);
       if (!payload) return res("Invalid token", 401);
 
-      const userId = payload.id;
+      const user = await getUserById(env, payload.id);
+      if (!user) return res("User not found", 401);
 
-      const userData = await env.ROLES.get(`user:${userId}`, "json");
-      if (!userData) return res("No role assigned", 403);
-
-      const role = userData.role;
-
-      /* ========= ROUTES ========= */
-
-      // 🔍 Voir serveurs
-      if (url.pathname === "/servers" && req.method === "GET") {
-        requirePerm(role, "VIEW_SERVERS");
-        return proxyPtero("/api/application/servers", env);
+      // 🚀 bootstrap chef
+      if (user.email === BOOTSTRAP_ADMIN_EMAIL && user.role !== "chef") {
+        await env.DB.prepare(
+          "UPDATE users SET role = 'chef' WHERE id = ?"
+        ).bind(user.id).run();
+        user.role = "chef";
       }
 
-      // ⏸️ Suspendre serveur
-      if (url.pathname === "/servers/suspend" && req.method === "POST") {
-        requirePerm(role, "SUSPEND_SERVER");
+      /* ================= ROUTES ================= */
 
-        const { serverId } = await req.json();
-        await addLog(env, userId, role, "SUSPEND_SERVER", `server:${serverId}`);
-
-        return proxyPtero(
-          `/api/application/servers/${serverId}/suspend`,
-          env,
-          "POST"
-        );
+      // 👑 CREATE USER (CHEF)
+      if (url.pathname === "/admin/users/create" && req.method === "POST") {
+        requireChef(user);
+        return createUser(req, env, user);
       }
 
-      // ✏️ Renommer serveur
-      if (url.pathname === "/servers/rename" && req.method === "POST") {
-        requirePerm(role, "RENAME_SERVER");
-
-        const { serverId, name } = await req.json();
-        await addLog(env, userId, role, "RENAME_SERVER", `server:${serverId}`);
-
-        return proxyPtero(
-          `/api/application/servers/${serverId}/details`,
-          env,
-          "PATCH",
-          { name }
-        );
+      // 👀 LIST USERS (CHEF)
+      if (url.pathname === "/admin/users" && req.method === "GET") {
+        requireChef(user);
+        return listUsers(env);
       }
 
-      // ❌ Supprimer utilisateur
-      if (url.pathname === "/users/delete" && req.method === "DELETE") {
-        requirePerm(role, "DELETE_USER");
-
-        const { targetUserId } = await req.json();
-        const target = await env.ROLES.get(`user:${targetUserId}`, "json");
-
-        if (!target) return res("User not found", 404);
-        if (target.role === "chef") return res("Cannot delete chef", 403);
-
-        await env.ROLES.delete(`user:${targetUserId}`);
-        await addLog(env, userId, role, "DELETE_USER", `user:${targetUserId}`);
-
-        return proxyPtero(
-          `/api/application/users/${targetUserId}`,
-          env,
-          "DELETE"
-        );
+      // 🔁 RESET PASSWORD (CHEF)
+      if (url.pathname === "/admin/users/reset-password" && req.method === "POST") {
+        requireChef(user);
+        return resetPassword(req, env);
       }
 
-      // 👑 Gestion rôles (chef)
-      if (url.pathname === "/roles/set" && req.method === "POST") {
-        requirePerm(role, "MANAGE_ROLES");
-
-        const { targetUserId, newRole } = await req.json();
-        if (!ROLE_HIERARCHY[newRole]) return res("Invalid role", 400);
-
-        const target = await env.ROLES.get(`user:${targetUserId}`, "json");
-        if (target?.role === "chef" && newRole !== "chef") {
-          return res("Chef immutable", 403);
-        }
-
-        await env.ROLES.put(
-          `user:${targetUserId}`,
-          JSON.stringify({ role: newRole })
-        );
-
-        await addLog(
-          env,
-          userId,
-          role,
-          "SET_ROLE",
-          `user:${targetUserId} => ${newRole}`
-        );
-
-        return res("Role updated");
+      // 🧩 CHANGE ROLE (CHEF)
+      if (url.pathname === "/admin/users/set-role" && req.method === "POST") {
+        requireChef(user);
+        return setUserRole(req, env);
       }
 
-      // 📜 Logs (chef only)
+      // 📜 LOGS (CHEF)
       if (url.pathname === "/logs" && req.method === "GET") {
-        requirePerm(role, "VIEW_LOGS");
-        const logs = await getLogs(env);
-        return json(logs);
+        requireChef(user);
+        return json(await getLogs(env));
       }
 
       return res("Not found", 404);
@@ -141,15 +77,142 @@ export default {
   }
 };
 
-/* =====================
-   JWT NATIF
-===================== */
+/* =====================================================
+   AUTH
+===================================================== */
+
+async function login(req, env) {
+  const { username, password } = await req.json();
+
+  const user = await env.DB
+    .prepare("SELECT * FROM users WHERE username = ?")
+    .bind(username)
+    .first();
+
+  if (!user) return res("Invalid credentials", 401);
+
+  const ok = await verifyPassword(password, user.password_hash);
+  if (!ok) return res("Invalid credentials", 401);
+
+  const token = await signJWT(
+    { id: user.id, email: user.email },
+    env.JWT_SECRET
+  );
+
+  return json({
+    token,
+    must_change_password: !!user.must_change_password
+  });
+}
+
+/* =====================================================
+   ADMIN ACTIONS
+===================================================== */
+
+async function createUser(req, env, actor) {
+  const { email, role } = await req.json();
+
+  const id = crypto.randomUUID();
+  const username = `user_${Math.floor(Math.random() * 10000)}`;
+  const tempPassword = generatePassword();
+  const hash = await hashPassword(tempPassword);
+
+  await env.DB.prepare(`
+    INSERT INTO users (id, username, email, role, password_hash, must_change_password, created_at)
+    VALUES (?, ?, ?, ?, ?, 1, ?)
+  `).bind(
+    id, username, email, role, hash, Date.now()
+  ).run();
+
+  await addLog(env, actor.id, "CREATE_USER", username);
+
+  return json({
+    username,
+    temporary_password: tempPassword // affiché UNE FOIS
+  });
+}
+
+async function listUsers(env) {
+  const users = await env.DB
+    .prepare("SELECT id, username, email, role, must_change_password FROM users")
+    .all();
+
+  return json(users.results);
+}
+
+async function resetPassword(req, env) {
+  const { userId } = await req.json();
+
+  const tempPassword = generatePassword();
+  const hash = await hashPassword(tempPassword);
+
+  await env.DB.prepare(`
+    UPDATE users
+    SET password_hash = ?, must_change_password = 1
+    WHERE id = ?
+  `).bind(hash, userId).run();
+
+  return json({
+    temporary_password: tempPassword
+  });
+}
+
+async function setUserRole(req, env) {
+  const { userId, role } = await req.json();
+
+  await env.DB.prepare(
+    "UPDATE users SET role = ? WHERE id = ?"
+  ).bind(role, userId).run();
+
+  return res("Role updated");
+}
+
+/* =====================================================
+   UTILS
+===================================================== */
+
+function requireChef(user) {
+  if (user.role !== "chef") {
+    throw new Response("Forbidden", { status: 403 });
+  }
+}
+
+async function getUserById(env, id) {
+  return env.DB
+    .prepare("SELECT * FROM users WHERE id = ?")
+    .bind(id)
+    .first();
+}
+
+/* ================= JWT ================= */
+
+async function signJWT(payload, secret) {
+  const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const body = btoa(JSON.stringify(payload));
+  const data = `${header}.${body}`;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(data)
+  );
+
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  return `${data}.${sigB64}`;
+}
 
 async function verifyJWT(token, secret) {
-  const [headerB64, payloadB64, signatureB64] = token.split(".");
-  if (!signatureB64) return null;
+  const [h, p, s] = token.split(".");
+  if (!s) return null;
 
-  const data = `${headerB64}.${payloadB64}`;
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -158,61 +221,48 @@ async function verifyJWT(token, secret) {
     ["verify"]
   );
 
-  const signature = Uint8Array.from(atob(signatureB64.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-  const valid = await crypto.subtle.verify(
+  const ok = await crypto.subtle.verify(
     "HMAC",
     key,
-    signature,
-    new TextEncoder().encode(data)
+    Uint8Array.from(atob(s), c => c.charCodeAt(0)),
+    new TextEncoder().encode(`${h}.${p}`)
   );
 
-  if (!valid) return null;
-
-  return JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/")));
+  if (!ok) return null;
+  return JSON.parse(atob(p));
 }
 
-/* =====================
-   UTILS
-===================== */
+/* ================= PASSWORD ================= */
 
-function requirePerm(role, perm) {
-  if (ROLE_HIERARCHY[role] < PERMISSIONS[perm]) {
-    throw new Response("Forbidden", { status: 403 });
-  }
+async function hashPassword(pwd) {
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(pwd)
+  );
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
 
-async function proxyPtero(path, env, method = "GET", body) {
-  const r = await fetch(env.PTERO_URL + path, {
-    method,
-    headers: {
-      "Authorization": `Bearer ${env.PTERO_KEY}`,
-      "Accept": "Application/vnd.pterodactyl.v1+json",
-      "Content-Type": "application/json"
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-
-  return new Response(await r.text(), {
-    status: r.status,
-    headers: { "Content-Type": "application/json" }
-  });
+async function verifyPassword(pwd, hash) {
+  return (await hashPassword(pwd)) === hash;
 }
 
-async function addLog(env, actorId, actorRole, action, target) {
-  const timestamp = Date.now();
+function generatePassword() {
+  return Math.random().toString(36).slice(-10) + "!";
+}
+
+/* ================= LOGS ================= */
+
+async function addLog(env, actorId, action, target) {
   await env.LOGS.put(
-    `log:${timestamp}`,
-    JSON.stringify({ actorId, actorRole, action, target, timestamp })
+    `log:${Date.now()}`,
+    JSON.stringify({ actorId, action, target, time: Date.now() })
   );
 }
 
-async function getLogs(env, limit = 50) {
+async function getLogs(env) {
   const list = await env.LOGS.list({ prefix: "log:" });
   return Promise.all(
-    list.keys
-      .sort((a, b) => b.name.localeCompare(a.name))
-      .slice(0, limit)
-      .map(k => env.LOGS.get(k.name, "json"))
+    list.keys.map(k => env.LOGS.get(k.name, "json"))
   );
 }
 
