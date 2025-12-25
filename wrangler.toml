@@ -1,13 +1,25 @@
 name = "panel-api"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+workers_dev = true
 
+# =========================
+# D1 DATABASE (USERS)
+# =========================
+[[d1_databases]]
+binding = "DB"
+database_name = "panel-users"
+database_id = "7ba98867-5dfb-4ea3-9e0f-7db9799c1a09"
+
+# =========================
+# KV NAMESPACES
+# =========================
 kv_namespaces = [
-  { binding = "ROLES", id = "53312659ade44015b4d25ff435a18467" },
   { binding = "LOGS", id = "b4d68796aae4488e8538f1cb15857bc0" }
 ]
 
+# =========================
+# ENV VARIABLES
+# =========================
 [vars]
 JWT_SECRET = "Bumpx@@@"
-PTERO_URL = "https://host.bumpx.fr"
-PTERO_KEY = "ptla_OqIzk07tqu35RifvrNfetwHn8gRPZ4Rl6WveCtDMYNq"
